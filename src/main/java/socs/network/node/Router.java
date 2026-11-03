@@ -31,6 +31,10 @@ public class Router {
   private ServerSocket serverSocket;
   private final BufferedReader consoleReader = new BufferedReader(new InputStreamReader(System.in));
 
+  private volatile boolean started = false;
+  public final AtomicInteger weightUpdateSent = new AtomicInteger(0);
+  public final AtomicInteger weightUpdateReceived = new AtomicInteger(0);
+
   // Buffer for concurrent attach requests
   private static class AttachRequest {
     final SOSPFPacket packet;
@@ -123,13 +127,18 @@ public class Router {
    */
   private void processAttach(String processIP, int processPort,
                              String simulatedIP, short weight) {
+    attachLink(processIP, processPort, simulatedIP, weight, true);
+  }
+
+  private Link attachLink(String processIP, int processPort, String simulatedIP,
+                          short weight, boolean announceAccepted) {
     // Check for duplicate attachment and find a free port atomically
     int freePort = -1;
     synchronized (ports) {
       for (Link link : ports) {
         if (link != null && link.router2.simulatedIPAddress.equals(simulatedIP)) {
           System.out.println("Already attached to " + simulatedIP);
-          return;
+          return null;
         }
       }
       for (int i = 0; i < ports.length; i++) {
@@ -141,7 +150,7 @@ public class Router {
     }
     if (freePort == -1) {
       System.out.println("All ports are occupied, cannot attach.");
-      return;
+      return null;
     }
 
     try {
@@ -171,18 +180,23 @@ public class Router {
         synchronized (ports) {
           ports[freePort] = link;
         }
-        System.out.println("Your attach request has been accepted;");
+        if (announceAccepted) {
+          System.out.println("Your attach request has been accepted;");
+        }
 
         Thread listener = new Thread(() -> listenOnLink(link));
         listener.setDaemon(true);
         listener.start();
+        return link;
       } else {
         // Rejected
         System.out.println("Your attach request has been rejected;");
         socket.close();
+        return null;
       }
     } catch (Exception e) {
       System.err.println("Failed to attach to " + simulatedIP + ": " + e.getMessage());
+      return null;
     }
   }
 
@@ -349,6 +363,9 @@ public class Router {
           } else if (packet.sospfType == 2) {
             appMessageReceived.incrementAndGet();
             handleApplicationMessage(packet);
+          } else if (packet.sospfType == 3){
+            weightUpdateReceived.incrementAndGet();
+            handleWeightUpdate(link, packet);
           }
         } catch (Exception e) {
           // a bad packet or handler bug must not kill this link's listener
@@ -401,7 +418,9 @@ public class Router {
    * broadcast Hello to neighbors and synchronize link state database
    */
   private void processStart() {
+    started = true;
     boolean hasTwoWay = false;
+
     synchronized (ports) {
       for (Link link : ports) {
         if (link != null){
@@ -413,6 +432,7 @@ public class Router {
         }
       }
     }
+
     if (hasTwoWay) {
       updateLocalLSA();
       broadcastLSAUpdate(lsd.getAllLSAs(), null);
@@ -503,7 +523,44 @@ public class Router {
    */
   private void processConnect(String processIP, int processPort,
                               String simulatedIP, short weight) {
+    if (!started) {
+      System.out.println("Cannot connect: run start first.");
+      return;
+    }
+    Link link = attachLink(processIP, processPort, simulatedIP, weight, false);
+    if (link == null) {
+      return; // attachLink already printed the reason
+    }
 
+    // same as start, but for this link only: we initiate the handshake
+    synchronized (this) {
+      link.startedByUs = true;
+    }
+    sendHello(link);
+
+    // The handshake completes on the listener thread; wait (up to 5s) for TWO_WAY.
+    // Checking under the router lock also guarantees the LSAUPDATE broadcast has been sent.
+    boolean established = false;
+    long deadline = System.currentTimeMillis() + 5000;
+    while (System.currentTimeMillis() < deadline) {
+      synchronized (this) {
+        established = link.router2.status == RouterStatus.TWO_WAY;
+      }
+      if (established) break;
+      try {
+        Thread.sleep(50);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
+
+    if (established) {
+      System.out.println("Link established with " + simulatedIP);
+      System.out.println("Broadcasting LSAUPDATE.");
+    } else {
+      System.out.println("Attached to " + simulatedIP + " but the handshake did not complete.");
+    }
   }
 
   /**
@@ -532,6 +589,8 @@ public class Router {
     System.out.println("LSAUPDATE received: " + lsaUpdateReceived.get());
     System.out.println("APP_MESSAGE sent: " + appMessageSent.get());
     System.out.println("APP_MESSAGE received: " + appMessageReceived.get());
+    System.out.println("WEIGHT_UPDATE sent: " + weightUpdateSent.get());
+    System.out.println("WEIGHT_UPDATE received: " + weightUpdateReceived.get());
   }
 
   /**
@@ -558,7 +617,67 @@ public class Router {
    * @param newWeight the new weight/cost for the link attached to this port
    */
   private void processUpdate(short portNumber, short newWeight) {
+    if (portNumber < 0 || portNumber >= ports.length) {
+      System.out.println("Invalid port number: must be between 0 and " + (ports.length - 1));
+      return;
+    }
+    if (newWeight < 0) {
+      System.out.println("Invalid weight: must not be negative.");
+      return;
+    }
 
+    Link link;
+    synchronized (ports) {
+      link = ports[portNumber];
+      if (link == null) {
+        System.out.println("Port " + portNumber + " is not in use.");
+        return;
+      }
+      link.weight = newWeight;
+    }
+
+    sendWeightUpdate(link, newWeight);   // remote end updates its own Link and LSA
+    System.out.println("Link weight updated");
+
+    synchronized (this) {                // rebuild LSA and flood as one step
+      updateLocalLSA();
+      System.out.println("Broadcasting LSAUPDATE");
+      broadcastLSAUpdate(lsd.getAllLSAs(), null);
+    }
+  }
+
+  // Tells the neighbor on this link about a new weight (sospfType = 3, WEIGHT_UPDATE)
+  private void sendWeightUpdate(Link link, int newWeight) {
+    try {
+      SOSPFPacket pkt = new SOSPFPacket();
+      pkt.srcProcessIP = rd.processIPAddress;
+      pkt.srcProcessPort = rd.processPortNumber;
+      pkt.srcIP = rd.simulatedIPAddress;
+      pkt.dstIP = link.router2.simulatedIPAddress;
+      pkt.sospfType = 3;
+      pkt.routerID = rd.simulatedIPAddress;
+      pkt.weight = newWeight;
+
+      synchronized (link) {
+        link.oos.reset();
+        link.oos.writeObject(pkt);
+        link.oos.flush();
+      }
+      weightUpdateSent.incrementAndGet();
+    } catch (Exception e) {
+      System.err.println("Failed to send WEIGHT_UPDATE to "
+              + link.router2.simulatedIPAddress + ": " + e.getMessage());
+    }
+  }
+
+  // The neighbor changed the weight of our shared link: mirror it, then advertise our new LSA
+  private synchronized void handleWeightUpdate(Link link, SOSPFPacket packet) {
+    synchronized (ports) {
+      link.weight = packet.weight;
+    }
+    System.out.println("Link weight with " + packet.srcIP + " updated to " + packet.weight);
+    updateLocalLSA();
+    broadcastLSAUpdate(lsd.getAllLSAs(), null);
   }
 
   /**
