@@ -12,6 +12,8 @@ import java.io.ObjectOutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Vector;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -34,6 +36,8 @@ public class Router {
   private volatile boolean started = false;
   public final AtomicInteger weightUpdateSent = new AtomicInteger(0);
   public final AtomicInteger weightUpdateReceived = new AtomicInteger(0);
+  public final AtomicInteger linkDownSent = new AtomicInteger(0);
+  public final AtomicInteger linkDownReceived = new AtomicInteger(0);
 
   // Buffer for concurrent attach requests
   private static class AttachRequest {
@@ -109,13 +113,42 @@ public class Router {
   }
 
   /**
-   * disconnect with the router identified by the given destination ip address
+   * disconnect with the router identified by the given port number.
    * Notice: this command should trigger the synchronization of database
    *
    * @param portNumber the port number which the link attaches at
    */
   private void processDisconnect(short portNumber) {
+    if (portNumber < 0 || portNumber >= ports.length) {
+      System.out.println("Invalid port number: must be between 0 and " + (ports.length - 1));
+      return;
+    }
 
+    Link link;
+    synchronized (ports) {
+      link = ports[portNumber];
+      if (link == null) {
+        System.out.println("Port " + portNumber + " is not in use.");
+        return;
+      }
+      ports[portNumber] = null;
+    }
+
+    // Explicit notification to neighbor on this link
+    sendLinkDown(link, (short) 4);
+
+    try {
+      link.socket.close();
+    } catch (Exception ignored) {}
+    link.router2.status = null;
+
+    System.out.println("Port " + portNumber + " disconnected");
+    System.out.println("Broadcasting LSAUPDATE");
+
+    synchronized (this) {
+      updateLocalLSA();
+      broadcastLSAUpdate(lsd.getAllLSAs(), null);
+    }
   }
 
   /**
@@ -366,6 +399,10 @@ public class Router {
           } else if (packet.sospfType == 3){
             weightUpdateReceived.incrementAndGet();
             handleWeightUpdate(link, packet);
+          } else if (packet.sospfType == 4 || packet.sospfType == 5) {
+            linkDownReceived.incrementAndGet();
+            handleLinkFailure(link);
+            break;
           }
         } catch (Exception e) {
           // a bad packet or handler bug must not kill this link's listener
@@ -373,7 +410,8 @@ public class Router {
         }
       }
     } catch (Exception e) {
-      // socket closed or link disconnected
+      // socket closed or link disconnected (unannounced failure or unexpected closure)
+      handleLinkFailure(link);
     }
   }
 
@@ -591,13 +629,73 @@ public class Router {
     System.out.println("APP_MESSAGE received: " + appMessageReceived.get());
     System.out.println("WEIGHT_UPDATE sent: " + weightUpdateSent.get());
     System.out.println("WEIGHT_UPDATE received: " + weightUpdateReceived.get());
+    System.out.println("LINK_DOWN sent: " + linkDownSent.get());
+    System.out.println("LINK_DOWN received: " + linkDownReceived.get());
   }
 
   /**
    * disconnect with all neighbors and quit the program
    */
   private void processQuit() {
+    System.out.println("Broadcasting final LSAUPDATE");
 
+    List<Link> activeLinks = new ArrayList<>();
+    synchronized (ports) {
+      for (int i = 0; i < ports.length; i++) {
+        if (ports[i] != null) {
+          if (ports[i].router2.status == RouterStatus.TWO_WAY) {
+            activeLinks.add(ports[i]);
+          }
+          ports[i] = null;
+        }
+      }
+    }
+
+    // Rebuild self-originated LSA with empty links list and incremented sequence number
+    LSA finalLSA;
+    synchronized (this) {
+      currentSeqNumber++;
+      finalLSA = new LSA();
+      finalLSA.linkStateID = rd.simulatedIPAddress;
+      finalLSA.lsaSeqNumber = currentSeqNumber;
+      // finalLSA.links is empty (no active links)
+      lsd.putLSA(finalLSA);
+    }
+
+    // Send final LSAUPDATE containing the empty LSA to each active neighbor
+    Vector<LSA> finalLSAList = new Vector<>();
+    finalLSAList.add(finalLSA);
+    for (Link link : activeLinks) {
+      sendLSAUpdate(link, finalLSAList);
+    }
+
+    // Send explicit ROUTER_DOWN notification (type 5) to each active neighbor
+    for (Link link : activeLinks) {
+      sendLinkDown(link, (short) 5);
+    }
+
+    // Small delay to ensure packets flush out across network before closing sockets
+    try {
+      Thread.sleep(150);
+    } catch (InterruptedException ignored) {}
+
+    // Close all neighbor sockets
+    for (Link link : activeLinks) {
+      try {
+        link.socket.close();
+      } catch (Exception ignored) {}
+      link.router2.status = null;
+    }
+
+    // Close listening server socket
+    try {
+      if (serverSocket != null) {
+        serverSocket.close();
+      }
+    } catch (Exception ignored) {}
+
+    System.out.println("Router shutting down.");
+    System.exit(0);
   }
 
   /**
@@ -678,6 +776,63 @@ public class Router {
     System.out.println("Link weight with " + packet.srcIP + " updated to " + packet.weight);
     updateLocalLSA();
     broadcastLSAUpdate(lsd.getAllLSAs(), null);
+  }
+
+  // Tells the neighbor on this link that the link or router is going down
+  // (sospfType = 4 for LINK_DOWN, 5 for ROUTER_DOWN)
+  private void sendLinkDown(Link link, short type) {
+    try {
+      SOSPFPacket pkt = new SOSPFPacket();
+      pkt.srcProcessIP = rd.processIPAddress;
+      pkt.srcProcessPort = rd.processPortNumber;
+      pkt.srcIP = rd.simulatedIPAddress;
+      pkt.dstIP = link.router2.simulatedIPAddress;
+      pkt.sospfType = type;
+      pkt.routerID = rd.simulatedIPAddress;
+
+      synchronized (link) {
+        link.oos.reset();
+        link.oos.writeObject(pkt);
+        link.oos.flush();
+      }
+      linkDownSent.incrementAndGet();
+    } catch (Exception e) {
+      // Remote end will detect socket closure
+    }
+  }
+
+  /**
+   * Idempotently handles link failure (explicit LINK_DOWN/ROUTER_DOWN or socket closure).
+   * Ensures that duplicate or overlapping failure notifications are processed exactly once.
+   */
+  private void handleLinkFailure(Link link) {
+    if (link == null) return;
+
+    boolean removed = false;
+    synchronized (ports) {
+      for (int i = 0; i < ports.length; i++) {
+        if (ports[i] == link) {
+          ports[i] = null;
+          removed = true;
+          break;
+        }
+      }
+    }
+
+    if (!removed) {
+      // Already cleaned up; idempotent guard against duplicate events
+      return;
+    }
+
+    try {
+      link.socket.close();
+    } catch (Exception ignored) {}
+    link.router2.status = null;
+
+    synchronized (this) {
+      updateLocalLSA();
+      broadcastLSAUpdate(lsd.getAllLSAs(), null);
+    }
   }
 
   /**
@@ -814,9 +969,13 @@ public class Router {
           if (command.startsWith("detect ")) {
             String[] cmdLine = command.split(" ");
             processDetect(cmdLine[1]);
-          } else if (command.startsWith("disconnect ")) {
+          } else if (command.startsWith("disconnect ") || command.equals("disconnect")) {
             String[] cmdLine = command.split(" ");
-            processDisconnect(Short.parseShort(cmdLine[1]));
+            if (cmdLine.length >= 2) {
+              processDisconnect(Short.parseShort(cmdLine[1]));
+            } else {
+              System.out.println("Usage: disconnect [port_number]");
+            }
           } else if (command.startsWith("quit")) {
             processQuit();
           } else if (command.startsWith("attach ")) {
