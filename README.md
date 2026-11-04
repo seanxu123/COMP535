@@ -50,6 +50,10 @@ You'll need the Process IP/Port to `attach` to it from another terminal.
 ```
 attach [Process IP] [Process Port] [Simulated IP] [Link Weight]
 start
+connect [Process IP] [Process Port] [Simulated IP] [Link Weight]
+update [Port Number] [New Weight]
+disconnect [Port Number]
+quit
 neighbors
 detect [Destination IP]
 send [Destination IP] [Message]
@@ -82,13 +86,26 @@ full, on both the initiating and accepting side.
 * `send [Destination IP] [Message]` sends an application message hop by hop along the shortest
   path. Intermediate routers print the source, destination, and next hop but never the payload;
   only the destination prints the message.
-* `stats` prints the number of HELLO, LSAUPDATE, and APP_MESSAGE messages sent and received since
-  the router started. A message sent to several neighbors counts once per neighbor, and a
-  forwarded application message counts as both received and sent. The HELLOs exchanged during
-  `attach` are included in the HELLO counters.
+* `stats` prints the number of HELLO, LSAUPDATE, APP_MESSAGE, WEIGHT_UPDATE, and LINK_DOWN messages
+  sent and received since the router started.
 * `dump` (debugging aid, not part of the spec) prints this router's current LSDB.
 
-**Usage note:** flooding is asynchronous, so after running `start` on every router, give the
+### PA3
+
+* `connect [Process IP] [Process Port] [Simulated IP] [Link Weight]` works like `attach`, but can only
+  be run after `start`. Once attached, it immediately kicks off the HELLO handshake with that neighbor,
+  rebuilds the local LSA with an incremented sequence number, and floods `LSAUPDATE` to sync the network.
+* `update [Port Number] [New Weight]` changes the link weight on that port (0 to 3). It sends a
+  `WEIGHT_UPDATE` message (type 3) to the neighbor so both ends stay in sync, increments sequence
+  numbers, and advertises the new LSAs.
+* `disconnect [Port Number]` removes the link on that port, sends a `LINK_DOWN` message (type 4) to the
+  neighbor, clears the port, increments the sequence number, and floods the updated LSA. The freed port
+  can be reused later for `attach` or `connect`.
+* `quit` shuts down the router. Before exiting, it clears all its ports, increments its sequence number,
+  and sends a final empty LSA (`links = []`) followed by a `ROUTER_DOWN` message (type 5) to all active
+  neighbors. Neighbors clean up their links and re-flood their own updated LSAs.
+
+**Usage note:** flooding is asynchronous, so after running `start` or changing topology, give the
 network a moment to converge (check with `dump`) before running `detect` or `send`.
 
 ## Troubleshooting
@@ -136,20 +153,37 @@ target/            # Compiled classes (generated)
 
 ## Implementation Notes
 
-* `connect`, `disconnect`, `update`, and `quit` are intentionally empty stubs (PA3).
-* Each `Link` keeps its socket connection open after a successful `attach` rather than closing
-  it, and a background thread listens on it. HELLO, LSAUPDATE, and application messages all
-  travel over that same connection.
-* Each router's LSA lists one entry per `TWO_WAY` neighbor. Dijkstra skips the weight-0
-  self-link every router's LSDB starts with.
-* Link streams are reset (`ObjectOutputStream.reset()`) before every write, so updated LSAs are
-  never replaced by stale cached copies.
+* Each `Link` keeps its socket connection open after `attach` or `connect`, and a background thread
+  listens on it. HELLO, LSAUPDATE, APP_MESSAGE, WEIGHT_UPDATE, and failure notifications all travel
+  over that same socket.
+* Each router's LSA lists one entry per `TWO_WAY` neighbor. Dijkstra skips the weight-0 self-link.
+* Link streams are reset (`ObjectOutputStream.reset()`) before every write so updated LSAs don't get
+  replaced by cached copies.
 * Restart the whole topology between test runs: LSA sequence numbers restart at 1 when a router
   process restarts, so neighbors would ignore a restarted router's new LSAs.
+
+## Failure Detection
+
+We use a combination of explicit protocol messages and socket-closure detection to catch when an
+adjacency is lost:
+
+* **Graceful disconnect / quit:** When `disconnect` runs, the router sends a `LINK_DOWN` packet
+  (type 4) over the link before closing the socket. When `quit` runs, the quitting router floods its
+  final empty LSA (`links = []`), sends a `ROUTER_DOWN` packet (type 5) to each neighbor, and closes its
+  sockets before exiting.
+* **Ungraceful failures:** If a router crashes or is killed unexpectedly (e.g. `kill -9`), the background
+  thread listening on that link (`listenOnLink`) catches the `SocketException` or `EOFException` and
+  triggers the same cleanup.
+* **Duplicate notifications (idempotency):** Since an explicit notification is right before socket closure,
+  the receiving router may catch both the packet and the closed socket. `handleLinkFailure` checks if
+  the link is still in the `ports` array under `synchronized (ports)`. If it was already removed, it
+  returns immediately. This ensures each adjacency loss only bumps the sequence number and floods
+  an LSA once. Freed ports can immediately be reused for new `attach` or `connect` calls.
 
 ## Collaboration Statement
 
 This project was completed collaboratively by **Hamza Chaudhry** and **Sean Xu**:
-* **Hamza Chaudhry**: Requirement 1 (LSDB Synchronization) and Requirement 4 (`stats`).
-* **Sean Xu**: Requirement 2 (Shortest Path / `detect`) and Requirement 3 (Message Forwarding / `send`).
+
+* **Hamza Chaudhry**: PA1 attach/start logic, PA2 LSDB sync and `stats`, PA3 `disconnect`, `quit`, and failure detection.
+* **Sean Xu**: PA1 HELLO handshake, PA2 Dijkstra (`detect`) and message forwarding (`send`), PA3 `connect` and `update` weight.
 
